@@ -1,13 +1,23 @@
 import streamlit as st
+import re
 from converters.sql_to_jinja import convert_sql_to_jinja
-# from migrator.snowflake_migrator import migrate_view_to_dbt
 from testing.query_generator import generate_comparison_queries
+from helpers.migrator import (
+    load_table_mapping,
+    connect_snowflake,
+    fetch_and_convert_views
+)
 
+# Page setup
 st.set_page_config(page_title="DBT Helper", layout="wide")
 st.title("🚀 DBT Helper App")
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["SQL → Jinja Converter", "Migrator", "Testing Queries"])
+tab1, tab2, tab3 = st.tabs([
+    "SQL → Jinja Converter",
+    "Migrator",
+    "Testing Queries"
+])
 
 # ---------------- TAB 1 ----------------
 with tab1:
@@ -21,73 +31,70 @@ with tab1:
             sql_text = uploaded_file.read().decode("utf-8")
         if sql_text:
             converted = convert_sql_to_jinja(sql_text)
-            st.success("Converted to Jinja SQL:")
+            st.success("✅ Converted to Jinja SQL:")
             st.code(converted, language="sql")
         else:
-            st.warning("Please upload a file or paste SQL text.")
+            st.warning("⚠️ Please upload a file or paste SQL text.")
 
 # ---------------- TAB 2 ----------------
 with tab2:
-    st.subheader("🔄 Snowflake → dbt Model Migrator")
+    st.subheader("Paste Views to Convert into dbt Models")
 
-    # Paste SQL text
-    view_sql = st.text_area("Paste View SQL here", height=300)
+    # Paste multiple views
+    views_input = st.text_area(
+        "Paste fully qualified view names (one per line):",
+        height=200,
+        placeholder=(
+            "RBK_DW_DB.SA_PIPELINE.V_OPPORTUNITY_LINE_F\n"
+            "RBK_DW_DB.SA_PIPELINE.V_QUOTE_LINE_F\n"
+            "RBK_DW_DB.FA_SALES.V_RPT_PIPELINE_PROJECTION_SS"
+        )
+    )
 
-    # Add tags
-    tags = st.multiselect(
-        "Add Tags",
+    # Tags
+    tags_multi = st.multiselect(
+        "Add Tags (Optional)",
         ["finance", "salesforce", "etl", "incremental", "snapshot"]
     )
 
-    def migrate_view_to_dbt(sql_text: str, tags: list) -> str:
-        """
-        Converts Snowflake SQL view into dbt model.
-        For now: adds tags + replaces schema.table with source().
-        """
-        # Simple schema → source mapping
-        schema_mapping = {
-            "SA_REVENUE": "revenue",
-            "SA_BOOKING": "booking",
-            "SA_CUSTOMER": "customer"
-        }
+    # Optional table mapping CSV
+    table_mapping_file = st.file_uploader("Upload table_mapping.csv (Optional)", type=["csv"])
+    table_mapping = load_table_mapping(table_mapping_file)
 
-        converted_sql = sql_text
+    if st.button("🚀 Migrate Views from Snowflake"):
+        views_list = [v.strip() for v in re.split(r"[\n]+", views_input) if v.strip()]
 
-        # Replace schema.table with source()
-        import re
-        for schema, source in schema_mapping.items():
-            pattern = re.compile(rf"\b{schema}\.([A-Za-z0-9_]+)\b", re.IGNORECASE)
-            converted_sql = pattern.sub(
-                rf"{{{{ source('{source}', '\1') }}}}",
-                converted_sql
-            )
-
-        # Add tags block at top
-        if tags:
-            tags_block = f"{{% set tags = {tags} %}}\n\n"
-            converted_sql = tags_block + converted_sql
-
-        return converted_sql
-
-    if st.button("🚀 Migrate View"):
-        if view_sql.strip():
-            model_sql = migrate_view_to_dbt(view_sql, tags)
-            st.success("✅ Converted dbt model:")
-            st.code(model_sql, language="sql")
-            
-            # Download button
-            st.download_button(
-                "💾 Download dbt Model",
-                model_sql,
-                file_name="model.sql",
-                mime="text/sql"
-            )
+        if not views_list:
+            st.warning("⚠️ Please paste at least one view name.")
         else:
-            st.warning("⚠️ Please paste a SQL view definition before migrating.")
+            try:
+                conn = connect_snowflake(
+                    user="RAHUL.CHOUDHARY@RUBRIK.COM",
+                    account="RUBRIK-ENTERPRISE",
+                    warehouse="DEV_WISDOM_WH",
+                    database="RBK_DW_DB",
+                    schema="COMMON",
+                    role="DEV_WISDOM_DBT_RW_ROLE"
+                )
 
+                migrated_models, all_sources = fetch_and_convert_views(
+                    conn, views_list, table_mapping, tags_multi
+                )
 
-# ---------------- TAB 3 ----------------
-# ---------------- TAB 3 ----------------
+                for view_name, sql in migrated_models.items():
+                    st.subheader(f"✅ {view_name}")
+                    st.code(sql, language="sql")
+
+                # Download button
+                st.download_button(
+                    "💾 Download All dbt Models",
+                    "\n\n".join(migrated_models.values()),
+                    file_name="all_models.sql",
+                    mime="text/sql"
+                )
+            except Exception as e:
+                st.error(f"❌ Snowflake connection failed: {e}")
+
 # ---------------- TAB 3 ----------------
 with tab3:
     st.subheader("📊 Generate Full Testing Queries from Object Names")
@@ -95,7 +102,7 @@ with tab3:
     # Comparison type
     comparison_type = st.radio(
         "Select Comparison Type:",
-        ["PROD vs DEV", "PROD vs UAT"]
+        ["PROD vs DEV", "UAT vs PROD"]
     )
 
     # Mode selection
@@ -146,6 +153,3 @@ with tab3:
                 )
             else:
                 st.warning("⚠️ Please paste at least one fully qualified Object Name.")
-
-
-# ---------------- Helper function ----------------
